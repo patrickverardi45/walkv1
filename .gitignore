@@ -1,0 +1,36 @@
+.aider*
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Backend uploads
+backend/uploads/
+
+# Node / Next
+node_modules/
+.next/
+
+# Env files
+.env
+.env.local
+web/.env.local
+backend/.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+# Root project ignores
+venv/
+__pycache__/
+*.pyc
+
+data/
+uploads/
+outputs/
+
+.git_old/
+web/.git_old/
+backend/.git_old/
