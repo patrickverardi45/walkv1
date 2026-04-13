@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "") ||
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/+$/, "") ||
   "http://127.0.0.1:8000";
 
@@ -167,6 +168,21 @@ type Viewport = {
   zoom: number;
   panX: number;
   panY: number;
+};
+
+type DrillPathRow = {
+  id: string;
+  startStation: string;
+  endStation: string;
+  lengthFt: number;
+  cost: number;
+  print: string;
+  sourceFile: string;
+  routeName: string;
+};
+
+type DrillPathAccumulator = DrillPathRow & {
+  groupKey: string;
 };
 
 const PROJECTION_BASE_WIDTH = 1000;
@@ -866,30 +882,20 @@ export default function RedlineMap() {
   const finalBillingTotal = useMemo(() => baseBillingTotal + exceptionTotal, [baseBillingTotal, exceptionTotal]);
 
   const drillPathRows = useMemo(() => {
-    const rows: Array<{
-      id: string;
-      startStation: string;
-      endStation: string;
-      lengthFt: number;
-      cost: number;
-      print: string;
-      sourceFile: string;
-      routeName: string;
-    }> = [];
+    const rows: DrillPathRow[] = [];
 
-    let current:
-      | {
-          id: string;
-          startStation: string;
-          endStation: string;
-          lengthFt: number;
-          cost: number;
-          print: string;
-          sourceFile: string;
-          routeName: string;
-          groupKey: string;
-        }
-      | null = null;
+    const toDrillPathRow = (row: DrillPathAccumulator): DrillPathRow => ({
+      id: row.id,
+      startStation: row.startStation,
+      endStation: row.endStation,
+      lengthFt: row.lengthFt,
+      cost: row.cost,
+      print: row.print,
+      sourceFile: row.sourceFile,
+      routeName: row.routeName,
+    });
+
+    let current: DrillPathAccumulator | null = null;
 
     redlineSegments.forEach((segment, idx) => {
       const lengthFt =
@@ -903,16 +909,7 @@ export default function RedlineMap() {
 
       if (!current || current.groupKey !== groupKey) {
         if (current) {
-          rows.push({
-            id: current.id,
-            startStation: current.startStation,
-            endStation: current.endStation,
-            lengthFt: current.lengthFt,
-            cost: current.cost,
-            print: current.print,
-            sourceFile: current.sourceFile,
-            routeName: current.routeName,
-          });
+          rows.push(toDrillPathRow(current));
         }
         current = {
           id: `drill-path-${idx + 1}`,
@@ -934,16 +931,7 @@ export default function RedlineMap() {
     });
 
     if (current) {
-      rows.push({
-        id: current.id,
-        startStation: current.startStation,
-        endStation: current.endStation,
-        lengthFt: current.lengthFt,
-        cost: current.cost,
-        print: current.print,
-        sourceFile: current.sourceFile,
-        routeName: current.routeName,
-      });
+      rows.push(toDrillPathRow(current));
     }
 
     return rows;
