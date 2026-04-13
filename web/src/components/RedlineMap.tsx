@@ -170,21 +170,6 @@ type Viewport = {
   panY: number;
 };
 
-type DrillPathRow = {
-  id: string;
-  startStation: string;
-  endStation: string;
-  lengthFt: number;
-  cost: number;
-  print: string;
-  sourceFile: string;
-  routeName: string;
-};
-
-type DrillPathAccumulator = DrillPathRow & {
-  groupKey: string;
-};
-
 const PROJECTION_BASE_WIDTH = 1000;
 const MAP_HEIGHT = 620;
 const MIN_ZOOM = 1;
@@ -881,10 +866,23 @@ export default function RedlineMap() {
   const baseBillingTotal = useMemo(() => effectiveFootage * numericCostPerFoot, [effectiveFootage, numericCostPerFoot]);
   const finalBillingTotal = useMemo(() => baseBillingTotal + exceptionTotal, [baseBillingTotal, exceptionTotal]);
 
-  const drillPathRows = useMemo<DrillPathRow[]>(() => {
-    const rows: DrillPathAccumulator[] = [];
+  const drillPathRows = useMemo(() => {
+    type DrillPathRow = {
+      id: string;
+      startStation: string;
+      endStation: string;
+      lengthFt: number;
+      cost: number;
+      print: string;
+      sourceFile: string;
+      routeName: string;
+    };
 
-    redlineSegments.forEach((segment, idx) => {
+    type DrillPathWorkingRow = DrillPathRow & {
+      groupKey: string;
+    };
+
+    const workingRows = redlineSegments.reduce<DrillPathWorkingRow[]>((acc, segment, idx) => {
       const lengthFt =
         typeof segment.length_ft === "number" && Number.isFinite(segment.length_ft) ? segment.length_ft : 0;
       const startStation = cleanDisplayText(segment.start_station);
@@ -894,10 +892,10 @@ export default function RedlineMap() {
       const routeName = cleanDisplayText(segment.route_name);
       const groupKey = `${routeName}||${print}||${sourceFile}`;
 
-      const current = rows[rows.length - 1];
+      const lastRow = acc.length > 0 ? acc[acc.length - 1] : undefined;
 
-      if (!current || current.groupKey !== groupKey) {
-        rows.push({
+      if (!lastRow || lastRow.groupKey !== groupKey) {
+        acc.push({
           id: `drill-path-${idx + 1}`,
           startStation,
           endStation,
@@ -908,17 +906,17 @@ export default function RedlineMap() {
           routeName,
           groupKey,
         });
-        return;
+        return acc;
       }
 
-      current.endStation = endStation;
-      current.lengthFt += lengthFt;
-      current.cost += lengthFt * numericCostPerFoot;
-    });
+      lastRow.endStation = endStation;
+      lastRow.lengthFt += lengthFt;
+      lastRow.cost += lengthFt * numericCostPerFoot;
+      return acc;
+    }, []);
 
-    return rows.map(({ groupKey: _groupKey, ...row }) => row);
+    return workingRows.map(({ groupKey: _groupKey, ...row }) => row);
   }, [redlineSegments, numericCostPerFoot]);
-
 
   const handleAddException = useCallback(() => {
     const label = extraExceptionLabel.trim();
