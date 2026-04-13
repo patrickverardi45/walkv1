@@ -884,18 +884,21 @@ export default function RedlineMap() {
   const drillPathRows = useMemo(() => {
     const rows: DrillPathRow[] = [];
 
-    const toDrillPathRow = (row: DrillPathAccumulator): DrillPathRow => ({
-      id: row.id,
-      startStation: row.startStation,
-      endStation: row.endStation,
-      lengthFt: row.lengthFt,
-      cost: row.cost,
-      print: row.print,
-      sourceFile: row.sourceFile,
-      routeName: row.routeName,
-    });
-
     let current: DrillPathAccumulator | null = null;
+
+    const pushCurrentRow = (row: DrillPathAccumulator | null) => {
+      if (!row) return;
+      rows.push({
+        id: row.id,
+        startStation: row.startStation,
+        endStation: row.endStation,
+        lengthFt: row.lengthFt,
+        cost: row.cost,
+        print: row.print,
+        sourceFile: row.sourceFile,
+        routeName: row.routeName,
+      });
+    };
 
     redlineSegments.forEach((segment, idx) => {
       const lengthFt =
@@ -908,9 +911,7 @@ export default function RedlineMap() {
       const groupKey = `${routeName}||${print}||${sourceFile}`;
 
       if (!current || current.groupKey !== groupKey) {
-        if (current) {
-          rows.push(toDrillPathRow(current));
-        }
+        pushCurrentRow(current);
         current = {
           id: `drill-path-${idx + 1}`,
           startStation,
@@ -930,9 +931,7 @@ export default function RedlineMap() {
       current.cost += lengthFt * numericCostPerFoot;
     });
 
-    if (current) {
-      rows.push(toDrillPathRow(current));
-    }
+    pushCurrentRow(current);
 
     return rows;
   }, [redlineSegments, numericCostPerFoot]);
