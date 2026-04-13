@@ -921,7 +921,7 @@ export default function RedlineMap() {
   const handleAddException = useCallback(() => {
     const label = extraExceptionLabel.trim();
     if (!label) return;
-    setExceptions((current) => [
+    setExceptions((current: ExceptionCost[]) => [
       ...current,
       { id: `custom-${Date.now()}`, label, amount: extraExceptionAmount.trim() },
     ]);
@@ -930,12 +930,12 @@ export default function RedlineMap() {
   }, [extraExceptionLabel, extraExceptionAmount]);
 
   const handleRemoveException = useCallback((id: string) => {
-    setExceptions((current) => current.filter((item) => item.id !== id));
+    setExceptions((current: ExceptionCost[]) => current.filter((item: ExceptionCost) => item.id !== id));
   }, []);
 
   const handleExceptionChange = useCallback((id: string, field: "label" | "amount", value: string) => {
-    setExceptions((current) =>
-      current.map((item) => (item.id === id ? { ...item, [field]: value } : item))
+    setExceptions((current: ExceptionCost[]) =>
+      current.map((item: ExceptionCost) => (item.id === id ? { ...item, [field]: value } : item))
     );
   }, []);
 
