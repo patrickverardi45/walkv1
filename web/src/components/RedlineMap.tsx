@@ -1609,7 +1609,7 @@ export default function RedlineMap() {
       status: "ended" as const,
     };
 
-    const updated: WalkSession[] = savedSessions.map((s) =>
+    const updated = savedSessions.map((s): WalkSession =>
       s.id === ended.id ? ended : s
     );
 
