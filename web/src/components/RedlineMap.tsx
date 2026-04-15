@@ -2272,7 +2272,7 @@ export default function RedlineMap() {
                   </div>
                   <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
                     {(() => {
-                      const isActive: boolean = activeSession && activeSession.status === "active";
+                      const isActive: boolean = !!(activeSession && activeSession.status === "active");
                       return activeSession ? (
                         <>
                           <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={openAddEntryModal} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ffffff", color: "#0f172a", pointerEvents: "auto" }}>Add Entry</button>
