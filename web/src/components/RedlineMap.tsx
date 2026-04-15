@@ -2271,14 +2271,17 @@ export default function RedlineMap() {
                     Debug: routeCoords: {routeCoords.length}, activeSession: {activeSession ? 'set' : 'null'}, clicks: {walkDebug.clicks}, status: {walkDebug.status}
                   </div>
                   <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
-                    {activeSession ? (
-                      <>
-                        <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={openAddEntryModal} disabled={busy || !activeSession || activeSession.status !== "active"} style={{ ...miniMapButton, background: "#ffffff", color: "#0f172a", pointerEvents: "auto" }}>Add Entry</button>
-                        <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={endWalk} disabled={busy || !activeSession || activeSession.status !== "active"} style={{ ...miniMapButton, background: "#ef4444", color: "#fff", pointerEvents: "auto" }}>End Walk</button>
-                      </>
-                    ) : (
-                      <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={startWalk} disabled={busy || !!(activeSession && activeSession.status === "active")} style={{ ...miniMapButton, background: activeSession && activeSession.status === "active" ? "#0f172a" : "#ffffff", color: activeSession && activeSession.status === "active" ? "#fff" : "#0f172a", pointerEvents: "auto" }}>Start Walk</button>
-                    )}
+                    {(() => {
+                      const isActive = activeSession && activeSession.status === "active";
+                      return activeSession ? (
+                        <>
+                          <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={openAddEntryModal} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ffffff", color: "#0f172a", pointerEvents: "auto" }}>Add Entry</button>
+                          <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={endWalk} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ef4444", color: "#fff", pointerEvents: "auto" }}>End Walk</button>
+                        </>
+                      ) : (
+                        <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={startWalk} disabled={busy || isActive} style={{ ...miniMapButton, background: isActive ? "#0f172a" : "#ffffff", color: isActive ? "#fff" : "#0f172a", pointerEvents: "auto" }}>Start Walk</button>
+                      );
+                    })()}
                   </div>
                 </div>
 
