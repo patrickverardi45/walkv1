@@ -5511,7 +5511,47 @@ def _total_design_length_ft(route_catalog: Sequence[Dict[str, Any]]) -> float:
 
 def _summary_payload(include_debug: bool = False) -> Dict[str, Any]:
     route_id = STATE.get("route_id")
+    # Primary source: explicit route_coords set by active route logic
     route_coords = STATE.get("route_coords", []) or []
+    # Surgical fallback: if route_coords is empty, expose existing loaded route geometry
+    # from the route catalog or KMZ line features so the frontend receives usable path
+    # for walk verification. This does not fabricate data—only surfaces already-loaded
+    # design geometry available in backend state.
+    if not route_coords:
+        try:
+            route_catalog = STATE.get("route_catalog", []) or []
+            for route in route_catalog:
+                coords = route.get("coords", []) or []
+                if isinstance(coords, list) and len(coords) >= 2:
+                    route_coords = coords
+                    break
+
+            if not route_coords:
+                kmz_ref = STATE.get("kmz_reference", {}) or {}
+                line_features = kmz_ref.get("line_features") if isinstance(kmz_ref.get("line_features"), list) else []
+                match = None
+                if line_features:
+                    if route_id:
+                        for feat in line_features:
+                            if str(feat.get("route_id") or "").strip() == str(route_id or "").strip():
+                                match = feat
+                                break
+                    if not match and STATE.get("route_name"):
+                        for feat in line_features:
+                            if str(feat.get("route_name") or "").strip() == str(STATE.get("route_name") or "").strip():
+                                match = feat
+                                break
+                    if not match:
+                        for feat in line_features:
+                            coords = feat.get("coords") if isinstance(feat.get("coords"), list) else []
+                            if len(coords) >= 2:
+                                match = feat
+                                break
+                if match and isinstance(match.get("coords"), list) and len(match.get("coords")) >= 2:
+                    route_coords = match.get("coords") or []
+        except Exception:
+            # On any unexpected issue, leave route_coords as-is (empty) and continue
+            route_coords = route_coords
     route_length_ft = float(STATE.get("route_length_ft", 0.0) or 0.0)
     redline_segments = STATE.get("redline_segments", []) or []
     station_points = STATE.get("station_points", []) or []

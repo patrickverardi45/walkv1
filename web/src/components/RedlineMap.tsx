@@ -99,6 +99,32 @@ type KmzPolygonFeature = {
   stroke_width?: number;
 };
 
+type WalkEntry = {
+  id: string;
+  station_text: string;
+  station_ft?: number | null;
+  note?: string;
+  photoDataUrl?: string | null; // optional base64 for V1
+  raw_lat: number;
+  raw_lon: number;
+  snapped_lat: number;
+  snapped_lon: number;
+  snapped_route_ft: number;
+  distance_to_route_ft: number;
+  created_at: string;
+};
+
+type WalkSession = {
+  id: string;
+  route_id?: string | null;
+  route_name?: string | null;
+  started_at: string;
+  ended_at?: string | null;
+  status: "active" | "ended";
+  entry_count: number;
+  entries: WalkEntry[];
+};
+
 type BackendState = {
   success?: boolean;
   message?: string;
@@ -593,6 +619,7 @@ export default function RedlineMap() {
   const [busy, setBusy] = useState(false);
   const [statusTone, setStatusTone] = useState<NoteTone>("neutral");
   const [statusText, setStatusText] = useState("Connecting to local beta backend...");
+  const [walkDebug, setWalkDebug] = useState({ clicks: 0, status: 'idle' });
   const [jobLabel, setJobLabel] = useState("");
   const [notes, setNotes] = useState("");
   const [costPerFoot, setCostPerFoot] = useState("5.00");
@@ -607,6 +634,20 @@ export default function RedlineMap() {
   const [stationPhotos, setStationPhotos] = useState<StationPhoto[]>([]);
   const [stationPhotosLoading, setStationPhotosLoading] = useState(false);
   const [stationPhotoBusy, setStationPhotoBusy] = useState(false);
+  // Walk session state (frontend-local, sandbox V1)
+  const [activeSession, setActiveSession] = useState<WalkSession | null>(null);
+  const [savedSessions, setSavedSessions] = useState<WalkSession[]>(() => {
+    try {
+      const raw = typeof window !== "undefined" ? localStorage.getItem("walk_sessions") : null;
+      return raw ? (JSON.parse(raw) as WalkSession[]) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+  const [showAddEntryModal, setShowAddEntryModal] = useState(false);
+  const [entryStationText, setEntryStationText] = useState("");
+  const [entryNote, setEntryNote] = useState("");
+  const [entryPhotoFile, setEntryPhotoFile] = useState<File | null>(null);
   const [viewport, setViewport] = useState<Viewport>({ zoom: 1, panX: 0, panY: 0 });
   const [didInitialFit, setDidInitialFit] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
@@ -770,6 +811,21 @@ export default function RedlineMap() {
       })
       .filter((item): item is { idx: number; point: StationPoint; world: ScreenPoint } => Boolean(item));
   }, [stationPoints, renderBounds, projectionMetrics]);
+
+  const projectedEntries = useMemo(() => {
+    if (!renderBounds || !projectionMetrics) return [] as Array<{ id: string; entry: WalkEntry; world: ScreenPoint }>;
+    const entries = (activeSession?.entries || []).filter(Boolean) as WalkEntry[];
+    return entries
+      .map((entry) => {
+        if (typeof entry.raw_lat !== "number" || typeof entry.raw_lon !== "number") return null;
+        return {
+          id: entry.id,
+          entry,
+          world: projectWorldPoint(entry.raw_lat, entry.raw_lon, renderBounds, projectionMetrics),
+        };
+      })
+      .filter((it): it is { id: string; entry: WalkEntry; world: ScreenPoint } => Boolean(it));
+  }, [activeSession?.entries, renderBounds, projectionMetrics]);
 
   const visibleLabelIndices = useMemo(() => {
     const result = new Set<number>();
@@ -1506,6 +1562,207 @@ export default function RedlineMap() {
     panStartRef.current = null;
   }
 
+  // --- Walk session helpers (frontend-only sandbox V1) ---
+  function persistSessions(sessions: WalkSession[]) {
+    try {
+      localStorage.setItem("walk_sessions", JSON.stringify(sessions));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  function startWalk() {
+    setWalkDebug(prev => ({ ...prev, clicks: prev.clicks + 1, status: 'startWalk clicked' }));
+    if (!routeCoords || routeCoords.length < 2) {
+      setWalkDebug(prev => ({ ...prev, status: 'route check failed' }));
+      setStatusText("Load a route before starting a walk.");
+      setStatusTone("warning");
+      return;
+    }
+    setWalkDebug(prev => ({ ...prev, status: 'route check passed' }));
+    const id = `walk_${Date.now()}`;
+    const session: WalkSession = {
+      id,
+      route_id: state?.suggested_route_id || state?.selected_route_name || state?.route_name || null,
+      route_name: state?.selected_route_name || state?.route_name || null,
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      status: "active",
+      entry_count: 0,
+      entries: [],
+    };
+    setWalkDebug(prev => ({ ...prev, status: 'session created' }));
+    const next = [session, ...savedSessions];
+    setSavedSessions(next);
+    persistSessions(next);
+    setActiveSession(session);
+    setWalkDebug(prev => ({ ...prev, status: 'setActiveSession called' }));
+    setStatusText("Walk started.");
+    setStatusTone("success");
+  }
+
+  function endWalk() {
+    if (!activeSession) return;
+    const ended = { ...activeSession, ended_at: new Date().toISOString(), status: "ended" };
+    const updated = savedSessions.map((s) => (s.id === ended.id ? ended : s));
+    setSavedSessions(updated);
+    persistSessions(updated);
+    setActiveSession(null);
+    setShowAddEntryModal(false);
+    setStatusText("Walk ended.");
+    setStatusTone("neutral");
+  }
+
+  function openAddEntryModal() {
+    if (!activeSession || activeSession.status !== "active") {
+      setStatusText("Start a walk first.");
+      setStatusTone("warning");
+      return;
+    }
+    setEntryStationText("");
+    setEntryNote("");
+    setEntryPhotoFile(null);
+    setShowAddEntryModal(true);
+  }
+
+  function parseStationToFeet(text: string): number | null {
+    if (!text) return null;
+    const raw = String(text).trim().toUpperCase();
+    if (raw.includes("+")) {
+      const [l, r] = raw.split("+", 2);
+      const L = parseInt(l.replace(/\D/g, "") || "0", 10);
+      const R = parseInt(r.replace(/\D/g, "") || "0", 10);
+      return L * 100 + R;
+    }
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length < 3) return null;
+    const left = parseInt(digits.slice(0, -2), 10);
+    const right = parseInt(digits.slice(-2), 10);
+    return left * 100 + right;
+  }
+
+  function haversineFeet(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const toRad = (v: number) => (v * Math.PI) / 180;
+    const Rm = 6371000.0;
+    const dlat = toRad(lat2 - lat1);
+    const dlon = toRad(lon2 - lon1);
+    const a = Math.sin(dlat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dlon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Rm * c * 3.28084;
+  }
+
+  function buildChainage(coords: number[][]) {
+    const chain: number[] = [0];
+    for (let i = 1; i < coords.length; i++) {
+      chain.push(chain[i - 1] + haversineFeet(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]));
+    }
+    return chain;
+  }
+
+  function snapToRoute(lat: number, lon: number, route: number[][]) {
+    if (!route || route.length === 0) return null;
+    if (route.length === 1) return { lat: route[0][0], lon: route[0][1], route_ft: 0, distance_ft: haversineFeet(lat, lon, route[0][0], route[0][1]) };
+    const lat0 = route[0][0];
+    const chain = buildChainage(route);
+    let bestDist = Number.POSITIVE_INFINITY;
+    let bestLat = route[0][0];
+    let bestLon = route[0][1];
+    let bestFt = 0;
+    for (let i = 1; i < route.length; i++) {
+      const a = route[i - 1];
+      const b = route[i];
+      // project to segment in local meters using planar approx
+      const ax = a[1] * Math.cos((lat0 * Math.PI) / 180);
+      const bx = b[1] * Math.cos((lat0 * Math.PI) / 180);
+      const px = lon * Math.cos((lat0 * Math.PI) / 180);
+      const ay = a[0];
+      const by = b[0];
+      const py = lat;
+      const dx = bx - ax;
+      const dy = by - ay;
+      const segLen2 = dx * dx + dy * dy;
+      let t = 0;
+      if (segLen2 > 1e-12) {
+        t = ((px - ax) * dx + (py - ay) * dy) / segLen2;
+        t = Math.max(0, Math.min(1, t));
+      }
+      const qx = ax + t * dx;
+      const qy = ay + t * dy;
+      // convert back to lon approx
+      const qlon = qx / Math.cos((lat0 * Math.PI) / 180);
+      const qlat = qy;
+      const dist = haversineFeet(lat, lon, qlat, qlon);
+      const segStartFt = chain[i - 1];
+      const segLenFt = Math.max(1e-6, chain[i] - chain[i - 1]);
+      const routeFt = segStartFt + t * segLenFt;
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestLat = qlat;
+        bestLon = qlon;
+        bestFt = routeFt;
+      }
+    }
+    return { lat: bestLat, lon: bestLon, route_ft: Math.round(bestFt * 100) / 100, distance_ft: Math.round(bestDist * 100) / 100 };
+  }
+
+  async function submitAddEntry() {
+    if (!activeSession) return;
+    if (!navigator.geolocation) {
+      setStatusText("Geolocation not available on this device.");
+      setStatusTone("error");
+      return;
+    }
+    setBusy(true);
+    try {
+      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, maximumAge: 3000, timeout: 8000 });
+      });
+      const rawLat = pos.coords.latitude;
+      const rawLon = pos.coords.longitude;
+      const stationFt = parseStationToFeet(entryStationText) ?? null;
+      let photoDataUrl: string | null = null;
+      if (entryPhotoFile) {
+        photoDataUrl = await new Promise<string>((resolve, reject) => {
+          const r = new FileReader();
+          r.onload = () => resolve(String(r.result || ""));
+          r.onerror = () => reject(new Error("photo read failed"));
+          r.readAsDataURL(entryPhotoFile);
+        });
+      }
+      const newEntry: WalkEntry = {
+        id: `entry_${Date.now()}`,
+        station_text: entryStationText || "",
+        station_ft: stationFt,
+        note: entryNote || "",
+        photoDataUrl,
+        raw_lat: rawLat,
+        raw_lon: rawLon,
+        // snapping is intentionally NOT applied in this V1 frontend-only pass
+        snapped_lat: rawLat,
+        snapped_lon: rawLon,
+        snapped_route_ft: 0,
+        distance_to_route_ft: 0,
+        created_at: new Date().toISOString(),
+      };
+      const updatedSession: WalkSession = { ...activeSession, entries: [...(activeSession.entries || []), newEntry], entry_count: (activeSession.entry_count || 0) + 1 };
+      setActiveSession(updatedSession);
+      const updatedSaved = savedSessions.map((s) => (s.id === updatedSession.id ? updatedSession : s));
+      // if session not present in savedSessions, add it
+      const exists = updatedSaved.some((s) => s.id === updatedSession.id);
+      const finalSaved = exists ? updatedSaved : [updatedSession, ...savedSessions];
+      setSavedSessions(finalSaved);
+      persistSessions(finalSaved);
+      setShowAddEntryModal(false);
+      setStatusText("Entry saved to walk.");
+      setStatusTone("success");
+    } catch (err) {
+      setStatusText(err instanceof Error ? err.message : "Failed to capture position.");
+      setStatusTone("error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const tooltipScreenPosition = useMemo(() => {
     if (hoverStationIndex === null && selectedStationIndex === null) return null;
     const idx = hoverStationIndex ?? selectedStationIndex;
@@ -1892,6 +2149,29 @@ export default function RedlineMap() {
                     );
                   })}
 
+                {projectedEntries.map(({ id, entry, world }) => {
+                  const screen = worldToScreen(world.x, world.y, viewport);
+                  return (
+                    <div
+                      key={`entry-${id}`}
+                      title={entry.station_text || entry.note || entry.id}
+                      style={{
+                        position: "absolute",
+                        left: Math.round(screen.x - 8),
+                        top: Math.round(screen.y - 8),
+                        width: 16,
+                        height: 16,
+                        borderRadius: 999,
+                        background: "#10b981",
+                        border: "2px solid #ffffff",
+                        boxShadow: "0 6px 18px rgba(0,0,0,0.24)",
+                        pointerEvents: "none",
+                        zIndex: 70,
+                      }}
+                    />
+                  );
+                })}
+
                 {boxZoom ? (
                   <div
                     style={{
@@ -1978,7 +2258,56 @@ export default function RedlineMap() {
                   </div>
                 ) : null}
 
-                              </div>
+                { /* Walk controls overlay (frontend-only V1) */ }
+                <div
+                  style={{ position: "absolute", right: 12, top: 12, zIndex: 1000, pointerEvents: "auto" }}
+                  onPointerDown={(e) => {
+                    if (e.target !== e.currentTarget) {
+                      e.stopPropagation();
+                    }
+                  }}
+                >
+                  <div style={{ fontSize: 10, color: 'red', marginBottom: 4, pointerEvents: "auto" }}>
+                    Debug: routeCoords: {routeCoords.length}, activeSession: {activeSession ? 'set' : 'null'}, clicks: {walkDebug.clicks}, status: {walkDebug.status}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
+                    {activeSession ? (
+                      <>
+                        <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={openAddEntryModal} disabled={busy || !activeSession || activeSession.status !== "active"} style={{ ...miniMapButton, background: "#ffffff", color: "#0f172a", pointerEvents: "auto" }}>Add Entry</button>
+                        <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={endWalk} disabled={busy || !activeSession || activeSession.status !== "active"} style={{ ...miniMapButton, background: "#ef4444", color: "#fff", pointerEvents: "auto" }}>End Walk</button>
+                      </>
+                    ) : (
+                      <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={startWalk} disabled={busy || !!(activeSession && activeSession.status === "active")} style={{ ...miniMapButton, background: activeSession && activeSession.status === "active" ? "#0f172a" : "#ffffff", color: activeSession && activeSession.status === "active" ? "#fff" : "#0f172a", pointerEvents: "auto" }}>Start Walk</button>
+                    )}
+                  </div>
+                </div>
+
+                { /* Add Entry Modal */ }
+                {showAddEntryModal ? (
+                  <div
+                    style={{ position: "absolute", left: 20, top: 20, zIndex: 1000, width: 420, borderRadius: 12, background: "#ffffff", border: "1px solid #dbe4ee", boxShadow: "0 18px 42px rgba(0,0,0,0.28)", padding: 12, pointerEvents: "auto" }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", pointerEvents: "auto" }}>
+                      <div style={{ fontWeight: 800 }}>Add Walk Entry</div>
+                      <div style={{ fontSize: 12, color: "#64748b" }}>{activeSession ? `${activeSession.entry_count} entries` : "No active session"}</div>
+                    </div>
+                    <div style={{ marginTop: 8, display: "grid", gap: 8, pointerEvents: "auto" }}>
+                      <input value={entryStationText} onChange={(e) => setEntryStationText(e.target.value)} placeholder="Station (e.g. 12+34 or 1234)" style={{ borderRadius: 8, border: "1px solid #cfd8e3", padding: "8px 10px", pointerEvents: "auto" }} />
+                      <textarea value={entryNote} onChange={(e) => setEntryNote(e.target.value)} placeholder="Note (optional)" style={{ borderRadius: 8, border: "1px solid #cfd8e3", padding: "8px 10px", minHeight: 80, pointerEvents: "auto" }} />
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", pointerEvents: "auto" }}>
+                        <input type="file" accept="image/*" onChange={(e) => setEntryPhotoFile(e.target.files ? e.target.files[0] : null)} style={{ pointerEvents: "auto" }} />
+                        <div style={{ fontSize: 12, color: "#64748b" }}>Optional photo (will be saved as base64 in V1)</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, marginTop: 6, pointerEvents: "auto" }}>
+                        <button onClick={() => setShowAddEntryModal(false)} style={{ ...buttonStyle("#ffffff", "#0f172a", "#000000", false), pointerEvents: "auto" }} onPointerDown={(e) => e.stopPropagation()}>Cancel</button>
+                        <button onClick={submitAddEntry} style={{ ...buttonStyle("#0f172a", "#ffffff", "#000000", busy), pointerEvents: "auto" }} onPointerDown={(e) => e.stopPropagation()}>Save Entry</button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
+              </div>
 
               <div
                 style={{
