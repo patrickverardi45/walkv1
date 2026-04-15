@@ -1603,8 +1603,16 @@ export default function RedlineMap() {
 
   function endWalk() {
     if (!activeSession) return;
-    const ended: WalkSession = { ...activeSession, ended_at: new Date().toISOString(), status: "ended" as const };
-    const updated: WalkSession[] = savedSessions.map((s) => (s.id === ended.id ? ended : s));
+    const ended: WalkSession = {
+      ...activeSession,
+      ended_at: new Date().toISOString(),
+      status: "ended" as const,
+    };
+
+    const updated: WalkSession[] = savedSessions.map((s) =>
+      s.id === ended.id ? ended : s
+    );
+
     setSavedSessions(updated);
     persistSessions(updated);
     setActiveSession(null);
