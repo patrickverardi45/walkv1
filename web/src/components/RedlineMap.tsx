@@ -667,6 +667,7 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   const [entryNote, setEntryNote] = useState("");
   const [entryPhotoFile, setEntryPhotoFile] = useState<File | null>(null);
   const mobilePhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingMobileCameraAfterModalRef = useRef(false);
   const [viewport, setViewport] = useState<Viewport>({ zoom: 1, panX: 0, panY: 0 });
   const [didInitialFit, setDidInitialFit] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
@@ -1266,6 +1267,21 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!isMobileWalk || !showAddEntryModal || !pendingMobileCameraAfterModalRef.current) return;
+    const id = window.setTimeout(() => {
+      pendingMobileCameraAfterModalRef.current = false;
+      mobilePhotoInputRef.current?.click();
+    }, 50);
+    return () => window.clearTimeout(id);
+  }, [isMobileWalk, showAddEntryModal]);
+
+  useEffect(() => {
+    if (!showAddEntryModal) {
+      pendingMobileCameraAfterModalRef.current = false;
+    }
+  }, [showAddEntryModal]);
 
   useEffect(() => {
     if (!showStations) {
@@ -2663,13 +2679,16 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                     <div
                       style={{
                         position: "absolute",
-                        left: 12,
-                        right: 12,
-                        bottom: 12,
+                        left: 10,
+                        right: 10,
+                        bottom: 10,
                         zIndex: 1001,
-                        display: "grid",
-                        gridTemplateColumns: "1fr 1fr",
+                        display: "flex",
+                        flexDirection: "column",
                         gap: 10,
+                        maxWidth: 520,
+                        marginLeft: "auto",
+                        marginRight: "auto",
                         pointerEvents: "auto",
                       }}
                       onPointerDown={(e) => e.stopPropagation()}
@@ -2679,9 +2698,12 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                         onClick={startWalk}
                         disabled={busy || (!!activeSession && activeSession.status === "active")}
                         style={{
+                          width: "100%",
                           ...buttonStyle("#0f172a", "#ffffff", "#0f172a", busy || (!!activeSession && activeSession.status === "active")),
-                          fontSize: 16,
-                          height: 52,
+                          fontSize: 17,
+                          minHeight: 54,
+                          paddingTop: 12,
+                          paddingBottom: 12,
                         }}
                       >
                         Start Walk
@@ -2691,9 +2713,12 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                         onClick={openAddEntryModal}
                         disabled={busy || !activeSession || activeSession.status !== "active"}
                         style={{
+                          width: "100%",
                           ...buttonStyle("#ffffff", "#0f172a", "#cfd8e3", busy || !activeSession || activeSession.status !== "active"),
-                          fontSize: 16,
-                          height: 52,
+                          fontSize: 17,
+                          minHeight: 54,
+                          paddingTop: 12,
+                          paddingBottom: 12,
                         }}
                       >
                         Add Station / Event
@@ -2707,49 +2732,59 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                             return;
                           }
                           if (!showAddEntryModal) {
-                            setStatusText("Add a station/event first, then tap Photo.");
-                            setStatusTone("warning");
+                            pendingMobileCameraAfterModalRef.current = true;
+                            openAddEntryModal();
                             return;
                           }
                           mobilePhotoInputRef.current?.click();
                         }}
                         disabled={busy || !activeSession || activeSession.status !== "active"}
                         style={{
+                          width: "100%",
                           ...buttonStyle("#ffffff", "#0f172a", "#cfd8e3", busy || !activeSession || activeSession.status !== "active"),
-                          fontSize: 16,
-                          height: 52,
+                          fontSize: 17,
+                          minHeight: 54,
+                          paddingTop: 12,
+                          paddingBottom: 12,
                         }}
                       >
                         Photo
                       </button>
-                      <button
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={endWalk}
-                        disabled={busy || !activeSession || activeSession.status !== "active"}
-                        style={{
-                          ...buttonStyle("#ef4444", "#ffffff", "#ef4444", busy || !activeSession || activeSession.status !== "active"),
-                          fontSize: 16,
-                          height: 52,
-                        }}
-                      >
-                        End Walk
-                      </button>
-                      <button
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={() => {
-                          setStatusText("Send Home is not implemented yet in this sandbox build.");
-                          setStatusTone("warning");
-                        }}
-                        disabled={busy}
-                        style={{
-                          gridColumn: "1 / -1",
-                          ...buttonStyle("#10b981", "#ffffff", "#10b981", busy),
-                          fontSize: 16,
-                          height: 52,
-                        }}
-                      >
-                        Send Home
-                      </button>
+                      <div style={{ display: "flex", gap: 10, width: "100%" }}>
+                        <button
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={endWalk}
+                          disabled={busy || !activeSession || activeSession.status !== "active"}
+                          style={{
+                            flex: 1,
+                            ...buttonStyle("#ef4444", "#ffffff", "#ef4444", busy || !activeSession || activeSession.status !== "active"),
+                            fontSize: 17,
+                            minHeight: 54,
+                            paddingTop: 12,
+                            paddingBottom: 12,
+                          }}
+                        >
+                          End Walk
+                        </button>
+                        <button
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={() => {
+                            setStatusText("Send Home is not implemented yet in this sandbox build.");
+                            setStatusTone("warning");
+                          }}
+                          disabled={busy}
+                          style={{
+                            flex: 1,
+                            ...buttonStyle("#10b981", "#ffffff", "#10b981", busy),
+                            fontSize: 17,
+                            minHeight: 54,
+                            paddingTop: 12,
+                            paddingBottom: 12,
+                          }}
+                        >
+                          Send Home
+                        </button>
+                      </div>
                     </div>
                   </>
                 ) : null}
