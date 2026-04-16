@@ -648,6 +648,7 @@ export default function RedlineMap() {
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
   // gpsTrailState mirrors gpsTrailRef but as React state so the trail polyline re-renders on each new point
   const [gpsTrailState, setGpsTrailState] = useState<GpsTrailPoint[]>([]);
+  const [snappedTrailState, setSnappedTrailState] = useState<GpsTrailPoint[]>([]);
   const [savedSessions, setSavedSessions] = useState<WalkSession[]>(() => {
     try {
       const raw = typeof window !== "undefined" ? localStorage.getItem("walk_sessions") : null;
@@ -832,10 +833,12 @@ export default function RedlineMap() {
     return entries
       .map((entry) => {
         if (typeof entry.raw_lat !== "number" || typeof entry.raw_lon !== "number") return null;
+        const entryLat = Number.isFinite(entry.snapped_lat) ? entry.snapped_lat : entry.raw_lat;
+        const entryLon = Number.isFinite(entry.snapped_lon) ? entry.snapped_lon : entry.raw_lon;
         return {
           id: entry.id,
           entry,
-          world: projectWorldPoint(entry.raw_lat, entry.raw_lon, renderBounds, projectionMetrics),
+          world: projectWorldPoint(entryLat, entryLon, renderBounds, projectionMetrics),
         };
       })
       .filter((it): it is { id: string; entry: WalkEntry; world: ScreenPoint } => Boolean(it));
@@ -844,9 +847,9 @@ export default function RedlineMap() {
   // Trail points projected into world coordinates for SVG rendering
   const projectedTrailPoints = useMemo(() => {
     if (!renderBounds || !projectionMetrics) return [] as Array<{ x: number; y: number }>;
-    const trail = gpsTrailState.length > 0 ? gpsTrailState : [];
+    const trail = snappedTrailState.length > 0 ? snappedTrailState : [];
     return trail.map((pt) => projectWorldPoint(pt.lat, pt.lon, renderBounds, projectionMetrics));
-  }, [gpsTrailState, renderBounds, projectionMetrics]);
+  }, [snappedTrailState, renderBounds, projectionMetrics]);
 
   const visibleLabelIndices = useMemo(() => {
     const result = new Set<number>();
@@ -1622,6 +1625,7 @@ export default function RedlineMap() {
     lastAcceptedRef.current = null;
     setGpsAccuracy(null);
     setGpsTrailState([]);
+    setSnappedTrailState([]);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
@@ -1660,8 +1664,17 @@ export default function RedlineMap() {
 
         gpsTrailRef.current.push(nextPoint);
         lastAcceptedRef.current = nextPoint;
+        const snapped = snapToRoute(nextPoint.lat, nextPoint.lon, routeCoords);
+        const snappedTrailPoint: GpsTrailPoint = snapped
+          ? {
+              ...nextPoint,
+              lat: snapped.lat,
+              lon: snapped.lon,
+            }
+          : nextPoint;
         // Mirror into state so the trail polyline re-renders
         setGpsTrailState([...gpsTrailRef.current]);
+        setSnappedTrailState((prev) => [...prev, snappedTrailPoint]);
       },
       (err) => {
         if (err.code === err.PERMISSION_DENIED) {
@@ -1861,6 +1874,7 @@ export default function RedlineMap() {
           r.readAsDataURL(entryPhotoFile);
         });
       }
+      const snapped = snapToRoute(rawLat, rawLon, routeCoords);
       const newEntry: WalkEntry = {
         id: `entry_${Date.now()}`,
         station_text: entryStationText || "",
@@ -1869,11 +1883,10 @@ export default function RedlineMap() {
         photoDataUrl,
         raw_lat: rawLat,
         raw_lon: rawLon,
-        // snapping is intentionally NOT applied in this V1 frontend-only pass
-        snapped_lat: rawLat,
-        snapped_lon: rawLon,
-        snapped_route_ft: 0,
-        distance_to_route_ft: 0,
+        snapped_lat: snapped?.lat ?? rawLat,
+        snapped_lon: snapped?.lon ?? rawLon,
+        snapped_route_ft: snapped?.route_ft ?? 0,
+        distance_to_route_ft: snapped?.distance_ft ?? 0,
         created_at: new Date().toISOString(),
       };
       const updatedSession: WalkSession = { ...activeSession, entries: [...(activeSession.entries || []), newEntry], entry_count: (activeSession.entry_count || 0) + 1 };
