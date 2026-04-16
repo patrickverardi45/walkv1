@@ -1604,6 +1604,7 @@ export default function RedlineMap() {
     const ACCURACY_THRESHOLD_M = 20;
     const MIN_DISTANCE_M = 3;
     const MIN_INTERVAL_MS = 2000;
+    const MAX_JUMP_M = 15;
 
     if (!navigator.geolocation) {
       setGpsAccuracy(null);
@@ -1646,6 +1647,9 @@ export default function RedlineMap() {
         if (last) {
           const dtMs = nextPoint.ts - last.ts;
           const dMeters = haversineFeet(last.lat, last.lon, nextPoint.lat, nextPoint.lon) / 3.28084;
+          if (dMeters > MAX_JUMP_M) {
+            return;
+          }
           if (dtMs < MIN_INTERVAL_MS) {
             return;
           }
