@@ -125,6 +125,13 @@ type WalkSession = {
   entries: WalkEntry[];
 };
 
+type GpsTrailPoint = {
+  lat: number;
+  lon: number;
+  accuracy_m: number;
+  ts: number;
+};
+
 type BackendState = {
   success?: boolean;
   message?: string;
@@ -619,7 +626,6 @@ export default function RedlineMap() {
   const [busy, setBusy] = useState(false);
   const [statusTone, setStatusTone] = useState<NoteTone>("neutral");
   const [statusText, setStatusText] = useState("Connecting to local beta backend...");
-  const [walkDebug, setWalkDebug] = useState({ clicks: 0, status: 'idle' });
   const [jobLabel, setJobLabel] = useState("");
   const [notes, setNotes] = useState("");
   const [costPerFoot, setCostPerFoot] = useState("5.00");
@@ -636,6 +642,12 @@ export default function RedlineMap() {
   const [stationPhotoBusy, setStationPhotoBusy] = useState(false);
   // Walk session state (frontend-local, sandbox V1)
   const [activeSession, setActiveSession] = useState<WalkSession | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const gpsTrailRef = useRef<GpsTrailPoint[]>([]);
+  const lastAcceptedRef = useRef<GpsTrailPoint | null>(null);
+  const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
+  // gpsTrailState mirrors gpsTrailRef but as React state so the trail polyline re-renders on each new point
+  const [gpsTrailState, setGpsTrailState] = useState<GpsTrailPoint[]>([]);
   const [savedSessions, setSavedSessions] = useState<WalkSession[]>(() => {
     try {
       const raw = typeof window !== "undefined" ? localStorage.getItem("walk_sessions") : null;
@@ -814,7 +826,9 @@ export default function RedlineMap() {
 
   const projectedEntries = useMemo(() => {
     if (!renderBounds || !projectionMetrics) return [] as Array<{ id: string; entry: WalkEntry; world: ScreenPoint }>;
-    const entries = (activeSession?.entries || []).filter(Boolean) as WalkEntry[];
+    // Use activeSession while walking; fall back to most recent saved session after end walk
+    const displaySession = activeSession || (savedSessions.length > 0 ? savedSessions[0] : null);
+    const entries = (displaySession?.entries || []).filter(Boolean) as WalkEntry[];
     return entries
       .map((entry) => {
         if (typeof entry.raw_lat !== "number" || typeof entry.raw_lon !== "number") return null;
@@ -825,7 +839,14 @@ export default function RedlineMap() {
         };
       })
       .filter((it): it is { id: string; entry: WalkEntry; world: ScreenPoint } => Boolean(it));
-  }, [activeSession?.entries, renderBounds, projectionMetrics]);
+  }, [activeSession, savedSessions, renderBounds, projectionMetrics]);
+
+  // Trail points projected into world coordinates for SVG rendering
+  const projectedTrailPoints = useMemo(() => {
+    if (!renderBounds || !projectionMetrics) return [] as Array<{ x: number; y: number }>;
+    const trail = gpsTrailState.length > 0 ? gpsTrailState : [];
+    return trail.map((pt) => projectWorldPoint(pt.lat, pt.lon, renderBounds, projectionMetrics));
+  }, [gpsTrailState, renderBounds, projectionMetrics]);
 
   const visibleLabelIndices = useMemo(() => {
     const result = new Set<number>();
@@ -1215,6 +1236,14 @@ export default function RedlineMap() {
   }, []);
 
   useEffect(() => {
+    return () => {
+      if (watchIdRef.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!showStations) {
       setHoverStationIndex(null);
       setSelectedStationIndex(null);
@@ -1571,15 +1600,98 @@ export default function RedlineMap() {
     }
   }
 
+  function startGpsKernel() {
+    const ACCURACY_THRESHOLD_M = 20;
+    const MIN_DISTANCE_M = 3;
+    const MIN_INTERVAL_MS = 2000;
+
+    if (!navigator.geolocation) {
+      setGpsAccuracy(null);
+      setStatusText("Geolocation not available on this device.");
+      setStatusTone("error");
+      return;
+    }
+
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+
+    gpsTrailRef.current = [];
+    lastAcceptedRef.current = null;
+    setGpsAccuracy(null);
+    setGpsTrailState([]);
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const accuracy = Number(pos.coords.accuracy);
+        if (!Number.isFinite(accuracy) || accuracy <= 0) {
+          setGpsAccuracy(null);
+          return;
+        }
+
+        setGpsAccuracy(accuracy);
+        if (accuracy > ACCURACY_THRESHOLD_M) {
+          return;
+        }
+
+        const nextPoint: GpsTrailPoint = {
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          accuracy_m: accuracy,
+          ts: pos.timestamp || Date.now(),
+        };
+
+        const last = lastAcceptedRef.current;
+        if (last) {
+          const dtMs = nextPoint.ts - last.ts;
+          const dMeters = haversineFeet(last.lat, last.lon, nextPoint.lat, nextPoint.lon) / 3.28084;
+          if (dtMs < MIN_INTERVAL_MS) {
+            return;
+          }
+          if (dMeters < MIN_DISTANCE_M) {
+            return;
+          }
+        }
+
+        gpsTrailRef.current.push(nextPoint);
+        lastAcceptedRef.current = nextPoint;
+        // Mirror into state so the trail polyline re-renders
+        setGpsTrailState([...gpsTrailRef.current]);
+      },
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) {
+          setStatusText("Location permission denied. Enable GPS access to capture walk points.");
+          setStatusTone("error");
+        } else {
+          setStatusText("GPS signal unavailable. Move to open sky and retry.");
+          setStatusTone("warning");
+        }
+        setGpsAccuracy(null);
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 0,
+        timeout: 10000,
+      }
+    );
+  }
+
+  function stopGpsKernel() {
+    if (watchIdRef.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+    }
+    watchIdRef.current = null;
+    lastAcceptedRef.current = null;
+    setGpsAccuracy(null);
+  }
+
   function startWalk() {
-    setWalkDebug(prev => ({ ...prev, clicks: prev.clicks + 1, status: 'startWalk clicked' }));
     if (!routeCoords || routeCoords.length < 2) {
-      setWalkDebug(prev => ({ ...prev, status: 'route check failed' }));
       setStatusText("Load a route before starting a walk.");
       setStatusTone("warning");
       return;
     }
-    setWalkDebug(prev => ({ ...prev, status: 'route check passed' }));
     const id = `walk_${Date.now()}`;
     const session: WalkSession = {
       id,
@@ -1591,18 +1703,18 @@ export default function RedlineMap() {
       entry_count: 0,
       entries: [],
     };
-    setWalkDebug(prev => ({ ...prev, status: 'session created' }));
     const next = [session, ...savedSessions];
     setSavedSessions(next);
     persistSessions(next);
     setActiveSession(session);
-    setWalkDebug(prev => ({ ...prev, status: 'setActiveSession called' }));
+    startGpsKernel();
     setStatusText("Walk started.");
     setStatusTone("success");
   }
 
   function endWalk() {
     if (!activeSession) return;
+    stopGpsKernel();
     const ended: WalkSession = {
       ...activeSession,
       ended_at: new Date().toISOString(),
@@ -1715,18 +1827,26 @@ export default function RedlineMap() {
 
   async function submitAddEntry() {
     if (!activeSession) return;
-    if (!navigator.geolocation) {
-      setStatusText("Geolocation not available on this device.");
-      setStatusTone("error");
-      return;
-    }
     setBusy(true);
     try {
-      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, maximumAge: 3000, timeout: 8000 });
-      });
-      const rawLat = pos.coords.latitude;
-      const rawLon = pos.coords.longitude;
+      let rawLat: number;
+      let rawLon: number;
+      const latestTrailPoint = gpsTrailRef.current[gpsTrailRef.current.length - 1];
+      if (latestTrailPoint) {
+        rawLat = latestTrailPoint.lat;
+        rawLon = latestTrailPoint.lon;
+      } else {
+        if (!navigator.geolocation) {
+          setStatusText("Geolocation not available on this device.");
+          setStatusTone("error");
+          return;
+        }
+        const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, maximumAge: 3000, timeout: 8000 });
+        });
+        rawLat = pos.coords.latitude;
+        rawLon = pos.coords.longitude;
+      }
       const stationFt = parseStationToFeet(entryStationText) ?? null;
       let photoDataUrl: string | null = null;
       if (entryPhotoFile) {
@@ -2122,6 +2242,95 @@ export default function RedlineMap() {
                       })}
                       </g>
                     ) : null}
+
+                    {/* GPS breadcrumb trail layer — renders during active walk and stays visible after end walk */}
+                    {projectedTrailPoints.length >= 2 ? (
+                      <g id="walk-trail-layer">
+                        {/* Casing */}
+                        <polyline
+                          points={projectedTrailPoints.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ")}
+                          fill="none"
+                          stroke="rgba(0,0,0,0.55)"
+                          strokeWidth={5}
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                        {/* Trail line */}
+                        <polyline
+                          points={projectedTrailPoints.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ")}
+                          fill="none"
+                          stroke="#38bdf8"
+                          strokeWidth={3}
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                        {/* Start dot */}
+                        <circle
+                          cx={projectedTrailPoints[0].x}
+                          cy={projectedTrailPoints[0].y}
+                          r={4}
+                          fill="#22c55e"
+                          stroke="rgba(255,255,255,0.9)"
+                          strokeWidth={1.5}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                        {/* Current position dot */}
+                        <circle
+                          cx={projectedTrailPoints[projectedTrailPoints.length - 1].x}
+                          cy={projectedTrailPoints[projectedTrailPoints.length - 1].y}
+                          r={5}
+                          fill="#38bdf8"
+                          stroke="rgba(255,255,255,0.95)"
+                          strokeWidth={1.5}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      </g>
+                    ) : projectedTrailPoints.length === 1 ? (
+                      <g id="walk-trail-layer">
+                        <circle
+                          cx={projectedTrailPoints[0].x}
+                          cy={projectedTrailPoints[0].y}
+                          r={5}
+                          fill="#38bdf8"
+                          stroke="rgba(255,255,255,0.95)"
+                          strokeWidth={1.5}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      </g>
+                    ) : null}
+
+                    {/* Walk entry dots inside SVG — visible during and after walk */}
+                    {projectedEntries.length > 0 ? (
+                      <g id="walk-entry-layer">
+                        {projectedEntries.map(({ id, entry, world }) => (
+                          <g key={`svg-entry-${id}`}>
+                            <circle
+                              cx={world.x}
+                              cy={world.y}
+                              r={5.5}
+                              fill="#10b981"
+                              stroke="rgba(255,255,255,0.92)"
+                              strokeWidth={1.5}
+                              vectorEffect="non-scaling-stroke"
+                            />
+                            {entry.station_text ? (
+                              <text
+                                x={world.x + 7}
+                                y={world.y - 6}
+                                fontSize={9}
+                                fill="#86efac"
+                                fontWeight="700"
+                                style={{ pointerEvents: "none", userSelect: "none" }}
+                              >
+                                {entry.station_text}
+                              </text>
+                            ) : null}
+                          </g>
+                        ))}
+                      </g>
+                    ) : null}
                   </svg>
                 ) : (
                   <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 24, color: "#cbd5e1", fontWeight: 700 }}>
@@ -2266,18 +2475,46 @@ export default function RedlineMap() {
                   </div>
                 ) : null}
 
-                { /* Walk controls overlay (frontend-only V1) */ }
+                { /* Walk controls overlay */ }
                 <div
                   style={{ position: "absolute", right: 12, top: 12, zIndex: 1000, pointerEvents: "auto" }}
-                  onPointerDown={(e) => {
-                    if (e.target !== e.currentTarget) {
-                      e.stopPropagation();
-                    }
-                  }}
+                  onPointerDown={(e) => { e.stopPropagation(); }}
                 >
-                  <div style={{ fontSize: 10, color: 'red', marginBottom: 4, pointerEvents: "auto" }}>
-                    Debug: routeCoords: {routeCoords.length}, activeSession: {activeSession ? 'set' : 'null'}, clicks: {walkDebug.clicks}, status: {walkDebug.status}
-                  </div>
+                  {/* Walk status pill — visible during active walk and just after end walk */}
+                  {(activeSession || (savedSessions.length > 0 && savedSessions[0].status === "ended")) ? (
+                    <div style={{
+                      marginBottom: 6,
+                      background: activeSession ? "rgba(14,24,34,0.92)" : "rgba(30,41,59,0.88)",
+                      border: activeSession ? "1px solid #38bdf8" : "1px solid #10b981",
+                      borderRadius: 10,
+                      padding: "6px 10px",
+                      pointerEvents: "none",
+                    }}>
+                      {activeSession ? (
+                        <>
+                          <div style={{ fontSize: 11, fontWeight: 800, color: "#38bdf8", letterSpacing: 0.3 }}>
+                            ● WALK ACTIVE
+                          </div>
+                          <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
+                            GPS: {gpsAccuracy === null ? "no signal" : gpsAccuracy > 20 ? `±${Math.round(gpsAccuracy)}m (weak)` : `±${Math.round(gpsAccuracy)}m`}
+                          </div>
+                          <div style={{ fontSize: 11, color: "#cbd5e1" }}>
+                            Trail pts: {gpsTrailState.length} · Entries: {activeSession.entry_count}
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: 11, fontWeight: 800, color: "#10b981", letterSpacing: 0.3 }}>
+                            ✓ WALK ENDED
+                          </div>
+                          <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
+                            Trail pts: {gpsTrailState.length} · Entries: {savedSessions[0].entry_count}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  ) : null}
+
                   <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
                     {(() => {
                       const isActive: boolean = !!(activeSession && activeSession.status === "active");
