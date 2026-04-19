@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import MobileWalkUI, { MobileWalkNorthCompass, type MobileWalkAddEntryPayload } from "./MobileWalkUI";
 
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "") ||
@@ -291,6 +292,98 @@ function cleanCoords(coords: number[][] | undefined | null): number[][] {
       Number.isFinite(pt[0]) &&
       Number.isFinite(pt[1])
   );
+}
+
+/** Haversine ground distance in meters (display-trail stabilization only). */
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (v: number) => (v * Math.PI) / 180;
+  const Rm = 6371000.0;
+  const dlat = toRad(lat2 - lat1);
+  const dlon = toRad(lon2 - lon1);
+  const a = Math.sin(dlat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dlon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Rm * c;
+}
+
+function planarMetersFromRef(lat: number, lon: number, refLat: number, refLon: number): { x: number; y: number } {
+  const phi = refLat * (Math.PI / 180);
+  const cosPhi = Math.max(Math.cos(phi), 0.01);
+  const R = 6371000;
+  return {
+    x: (lon - refLon) * (Math.PI / 180) * R * cosPhi,
+    y: (lat - refLat) * (Math.PI / 180) * R,
+  };
+}
+
+function perpDistanceToSegmentM(b: GpsTrailPoint, a: GpsTrailPoint, c: GpsTrailPoint): number {
+  const B = planarMetersFromRef(b.lat, b.lon, a.lat, a.lon);
+  const C = planarMetersFromRef(c.lat, c.lon, a.lat, a.lon);
+  const cLen = Math.hypot(C.x, C.y);
+  if (cLen < 0.35) return Math.hypot(B.x, B.y);
+  return Math.abs(B.x * C.y - B.y * C.x) / cLen;
+}
+
+function segmentProjectionT(b: GpsTrailPoint, a: GpsTrailPoint, c: GpsTrailPoint): number {
+  const B = planarMetersFromRef(b.lat, b.lon, a.lat, a.lon);
+  const C = planarMetersFromRef(c.lat, c.lon, a.lat, a.lon);
+  const cLen2 = C.x * C.x + C.y * C.y;
+  if (cLen2 < 1e-6) return 0.5;
+  return (B.x * C.x + B.y * C.y) / cLen2;
+}
+
+/**
+ * Display-only: derive a slightly cleaner snapped polyline for map rendering.
+ * Does not mutate raw trail state or saved entries — use only for SVG walk path.
+ */
+function stabilizeSnappedDisplayTrailForMap(trail: GpsTrailPoint[]): GpsTrailPoint[] {
+  if (trail.length <= 2) return trail.slice();
+
+  const MAX_PERP_M = 2.8;
+  const MAX_LEG_M = 14;
+  const MIN_T = 0.04;
+  const MAX_T = 0.96;
+  const PATH_SLACK_M = 1.8;
+
+  const collapsed: GpsTrailPoint[] = [trail[0]];
+  for (let i = 1; i < trail.length - 1; i++) {
+    const a = collapsed[collapsed.length - 1];
+    const b = trail[i];
+    const c = trail[i + 1];
+    const perp = perpDistanceToSegmentM(b, a, c);
+    const t = segmentProjectionT(b, a, c);
+    const dab = haversineMeters(a.lat, a.lon, b.lat, b.lon);
+    const dbc = haversineMeters(b.lat, b.lon, c.lat, c.lon);
+    const dac = haversineMeters(a.lat, a.lon, c.lat, c.lon);
+    const microZig =
+      perp <= MAX_PERP_M &&
+      dab <= MAX_LEG_M &&
+      dbc <= MAX_LEG_M &&
+      t >= MIN_T &&
+      t <= MAX_T &&
+      dab + dbc <= dac + PATH_SLACK_M;
+    if (microZig) {
+      continue;
+    }
+    collapsed.push(b);
+  }
+  collapsed.push(trail[trail.length - 1]);
+
+  if (collapsed.length <= 2) return collapsed;
+
+  const MAX_SHIFT_M = 2.2;
+  const blended: GpsTrailPoint[] = collapsed.map((p) => ({ ...p }));
+  for (let j = 1; j < collapsed.length - 1; j++) {
+    const prev = collapsed[j - 1];
+    const cur = collapsed[j];
+    const next = collapsed[j + 1];
+    const nLat = 0.22 * prev.lat + 0.56 * cur.lat + 0.22 * next.lat;
+    const nLon = 0.22 * prev.lon + 0.56 * cur.lon + 0.22 * next.lon;
+    const shift = haversineMeters(cur.lat, cur.lon, nLat, nLon);
+    if (shift <= MAX_SHIFT_M) {
+      blended[j] = { ...cur, lat: nLat, lon: nLon };
+    }
+  }
+  return blended;
 }
 
 function getBoundsFromCoords(coords: number[][]): Bounds | null {
@@ -644,6 +737,8 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   const [stationPhotoBusy, setStationPhotoBusy] = useState(false);
   // Walk session state (frontend-local, sandbox V1)
   const [activeSession, setActiveSession] = useState<WalkSession | null>(null);
+  /** Ended session shown in UI only after endWalk() in this runtime; never from savedSessions[0] on load. */
+  const [endedSessionForReview, setEndedSessionForReview] = useState<WalkSession | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const gpsTrailRef = useRef<GpsTrailPoint[]>([]);
   const lastAcceptedRef = useRef<GpsTrailPoint | null>(null);
@@ -654,20 +749,12 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   const [endedWalkSnappedTrail, setEndedWalkSnappedTrail] = useState<GpsTrailPoint[]>([]);
   const [endedWalkGpsTrail, setEndedWalkGpsTrail] = useState<GpsTrailPoint[]>([]);
   const [selectedWalkEntryId, setSelectedWalkEntryId] = useState<string | null>(null);
-  const [savedSessions, setSavedSessions] = useState<WalkSession[]>(() => {
-    try {
-      const raw = typeof window !== "undefined" ? localStorage.getItem("walk_sessions") : null;
-      return raw ? (JSON.parse(raw) as WalkSession[]) : [];
-    } catch (e) {
-      return [];
-    }
-  });
+  // Must start empty on server and first client render; localStorage is read in useEffect after hydration.
+  const [savedSessions, setSavedSessions] = useState<WalkSession[]>([]);
   const [showAddEntryModal, setShowAddEntryModal] = useState(false);
   const [entryStationText, setEntryStationText] = useState("");
   const [entryNote, setEntryNote] = useState("");
   const [entryPhotoFile, setEntryPhotoFile] = useState<File | null>(null);
-  const mobilePhotoInputRef = useRef<HTMLInputElement | null>(null);
-  const pendingMobileCameraAfterModalRef = useRef(false);
   const [viewport, setViewport] = useState<Viewport>({ zoom: 1, panX: 0, panY: 0 });
   const [didInitialFit, setDidInitialFit] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
@@ -678,6 +765,7 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   const [selectedStationIndex, setSelectedStationIndex] = useState<number | null>(null);
   const [hoverStationIndex, setHoverStationIndex] = useState<number | null>(null);
   const [showStations, setShowStations] = useState(false);
+  const [hasHydrated, setHasHydrated] = useState(false);
   const userHasAdjustedViewportRef = useRef(false);
   const lastAutoFitSignatureRef = useRef<string>("");
   const initialFitRafRef = useRef<number | null>(null);
@@ -686,9 +774,17 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   const routeCoords = useMemo(() => cleanCoords(state?.route_coords || []), [state]);
 
   const displaySession = useMemo(
-    () => activeSession || (savedSessions.length > 0 ? savedSessions[0] : null),
-    [activeSession, savedSessions]
+    () => activeSession ?? endedSessionForReview,
+    [activeSession, endedSessionForReview]
   );
+
+  /** Latest parent-accepted raw GPS sample (trail stores accepted points only). */
+  const currentGps = useMemo((): { lat: number; lon: number; accuracy_m: number } | null => {
+    const trail = gpsTrailState;
+    if (!trail.length) return null;
+    const p = trail[trail.length - 1];
+    return { lat: p.lat, lon: p.lon, accuracy_m: p.accuracy_m };
+  }, [gpsTrailState]);
 
   const redlineSegments = state?.redline_segments || [];
   const stationPoints = state?.station_points || [];
@@ -799,8 +895,9 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
 
   const kmzLinePaths = useMemo(
     () =>
-      kmzLineFeatures.map((feature) => ({
-        id: feature.feature_id || feature.route_id || `${feature.route_name || "kmz"}-${Math.random()}`,
+      // TODO: use stable server-known IDs if feature_id/route_id can be absent for multiple rows
+      kmzLineFeatures.map((feature, idx) => ({
+        id: feature.feature_id || feature.route_id || `${feature.route_name || "kmz"}-line-${idx}`,
         path: buildWorldPath(feature.coords || [], renderBounds, projectionMetrics),
       })),
     [kmzLineFeatures, renderBounds]
@@ -808,8 +905,8 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
 
   const kmzPolygonPaths = useMemo(
     () =>
-      kmzPolygonFeatures.map((feature) => ({
-        id: feature.feature_id || `${feature.name || "polygon"}-${Math.random()}`,
+      kmzPolygonFeatures.map((feature, idx) => ({
+        id: feature.feature_id || `${feature.name || "polygon"}-poly-${idx}`,
         path: buildWorldPath([...(feature.coords || []), (feature.coords || [])[0]], renderBounds, projectionMetrics),
       })),
     [kmzPolygonFeatures, renderBounds]
@@ -861,17 +958,23 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
     return snappedTrailState;
   }, [activeSession, snappedTrailState, endedWalkSnappedTrail]);
 
+  /** Snapped trail after display-only stabilization (map polyline); raw `gpsTrailState` unchanged. */
+  const walkSnappedDisplayStabilized = useMemo(
+    () => stabilizeSnappedDisplayTrailForMap(walkSnappedForDisplay),
+    [walkSnappedForDisplay]
+  );
+
   const selectedWalkEntry = useMemo(() => {
     if (!selectedWalkEntryId || !displaySession) return null;
     return displaySession.entries.find((e) => e.id === selectedWalkEntryId) ?? null;
   }, [selectedWalkEntryId, displaySession]);
 
-  // Trail points projected into world coordinates for SVG rendering
+  // Trail points projected into world coordinates for SVG rendering (stabilized snapped display only)
   const projectedTrailPoints = useMemo(() => {
     if (!renderBounds || !projectionMetrics) return [] as Array<{ x: number; y: number }>;
-    const trail = walkSnappedForDisplay.length > 0 ? walkSnappedForDisplay : [];
+    const trail = walkSnappedDisplayStabilized.length > 0 ? walkSnappedDisplayStabilized : [];
     return trail.map((pt) => projectWorldPoint(pt.lat, pt.lon, renderBounds, projectionMetrics));
-  }, [walkSnappedForDisplay, renderBounds, projectionMetrics]);
+  }, [walkSnappedDisplayStabilized, renderBounds, projectionMetrics]);
 
   const visibleLabelIndices = useMemo(() => {
     const result = new Set<number>();
@@ -1257,6 +1360,21 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   }
 
   useEffect(() => {
+    setHasHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("walk_sessions");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as WalkSession[];
+      if (Array.isArray(parsed)) setSavedSessions(parsed);
+    } catch {
+      // ignore corrupt storage
+    }
+  }, []);
+
+  useEffect(() => {
     fetchState("Connecting to local beta backend...");
   }, []);
 
@@ -1267,21 +1385,6 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
       }
     };
   }, []);
-
-  useEffect(() => {
-    if (!isMobileWalk || !showAddEntryModal || !pendingMobileCameraAfterModalRef.current) return;
-    const id = window.setTimeout(() => {
-      pendingMobileCameraAfterModalRef.current = false;
-      mobilePhotoInputRef.current?.click();
-    }, 50);
-    return () => window.clearTimeout(id);
-  }, [isMobileWalk, showAddEntryModal]);
-
-  useEffect(() => {
-    if (!showAddEntryModal) {
-      pendingMobileCameraAfterModalRef.current = false;
-    }
-  }, [showAddEntryModal]);
 
   useEffect(() => {
     if (!showStations) {
@@ -1653,11 +1756,6 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   }
 
   function startGpsKernel() {
-    const ACCURACY_THRESHOLD_M = 20;
-    const MIN_DISTANCE_M = 3;
-    const MIN_INTERVAL_MS = 2000;
-    const MAX_JUMP_M = 15;
-
     if (!navigator.geolocation) {
       setGpsAccuracy(null);
       setStatusText("Geolocation not available on this device.");
@@ -1678,38 +1776,39 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
+        const lat = pos.coords.latitude;
+        const lon = pos.coords.longitude;
         const accuracy = Number(pos.coords.accuracy);
+        const nowMs = Date.now();
+        const timestamp = pos.timestamp && pos.timestamp > 0 ? pos.timestamp : nowMs;
+
         if (!Number.isFinite(accuracy) || accuracy <= 0) {
           setGpsAccuracy(null);
           return;
         }
 
         setGpsAccuracy(accuracy);
-        if (accuracy > ACCURACY_THRESHOLD_M) {
+
+        const prevAccepted = lastAcceptedRef.current;
+        const accOk = accuracy <= 25;
+        const timeFresh = Math.abs(nowMs - timestamp) <= 8000;
+        let motionOk = true;
+        if (prevAccepted) {
+          const distMeters = haversineFeet(prevAccepted.lat, prevAccepted.lon, lat, lon) / 3.28084;
+          const dtSec = (timestamp - prevAccepted.ts) / 1000;
+          motionOk = distMeters >= 1.5 && dtSec >= 2;
+        }
+
+        if (!accOk || !timeFresh || !motionOk) {
           return;
         }
 
         const nextPoint: GpsTrailPoint = {
-          lat: pos.coords.latitude,
-          lon: pos.coords.longitude,
+          lat,
+          lon,
           accuracy_m: accuracy,
-          ts: pos.timestamp || Date.now(),
+          ts: timestamp,
         };
-
-        const last = lastAcceptedRef.current;
-        if (last) {
-          const dtMs = nextPoint.ts - last.ts;
-          const dMeters = haversineFeet(last.lat, last.lon, nextPoint.lat, nextPoint.lon) / 3.28084;
-          if (dMeters > MAX_JUMP_M) {
-            return;
-          }
-          if (dtMs < MIN_INTERVAL_MS) {
-            return;
-          }
-          if (dMeters < MIN_DISTANCE_M) {
-            return;
-          }
-        }
 
         gpsTrailRef.current.push(nextPoint);
         lastAcceptedRef.current = nextPoint;
@@ -1773,6 +1872,7 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
     setSavedSessions(next);
     persistSessions(next);
     setActiveSession(session);
+    setEndedSessionForReview(null);
     setEndedWalkSnappedTrail([]);
     setEndedWalkGpsTrail([]);
     setSelectedWalkEntryId(null);
@@ -1798,6 +1898,7 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
 
     setSavedSessions(updated);
     persistSessions(updated);
+    setEndedSessionForReview(ended);
     setActiveSession(null);
     setShowAddEntryModal(false);
     setStatusText("Walk ended.");
@@ -1840,6 +1941,18 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
     const a = Math.sin(dlat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dlon / 2) ** 2;
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return Rm * c * 3.28084;
+  }
+
+  /** Parent GPS acceptance for trail points and one-shot capture fallback. */
+  function isGpsPointAcceptableForTrail(next: GpsTrailPoint, prev: GpsTrailPoint | null, nowMs: number): boolean {
+    const acc = next.accuracy_m;
+    if (!Number.isFinite(acc) || acc <= 0 || acc > 25) return false;
+    if (Math.abs(nowMs - next.ts) > 8000) return false;
+    if (!prev) return true;
+    if (next.ts - prev.ts < 2000) return false;
+    const dMeters = haversineFeet(prev.lat, prev.lon, next.lat, next.lon) / 3.28084;
+    if (dMeters < 1.5) return false;
+    return true;
   }
 
   function buildChainage(coords: number[][]) {
@@ -1896,16 +2009,20 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
     return { lat: bestLat, lon: bestLon, route_ft: Math.round(bestFt * 100) / 100, distance_ft: Math.round(bestDist * 100) / 100 };
   }
 
-  async function submitAddEntry() {
+  async function submitAddEntry(payload?: MobileWalkAddEntryPayload) {
     if (!activeSession) return;
     setBusy(true);
     try {
+      const stationText = payload ? payload.stationText : entryStationText;
+      const noteText = payload ? payload.note : entryNote;
+      const photoFile = payload ? payload.photoFile : entryPhotoFile;
+
       let rawLat: number;
       let rawLon: number;
-      const latestTrailPoint = gpsTrailRef.current[gpsTrailRef.current.length - 1];
-      if (latestTrailPoint) {
-        rawLat = latestTrailPoint.lat;
-        rawLon = latestTrailPoint.lon;
+      const lastAcc = lastAcceptedRef.current;
+      if (lastAcc) {
+        rawLat = lastAcc.lat;
+        rawLon = lastAcc.lon;
       } else {
         if (!navigator.geolocation) {
           setStatusText("Geolocation not available on this device.");
@@ -1915,25 +2032,38 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
         const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
           navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, maximumAge: 3000, timeout: 8000 });
         });
-        rawLat = pos.coords.latitude;
-        rawLon = pos.coords.longitude;
+        const acc = Number(pos.coords.accuracy);
+        const nowMs = Date.now();
+        const cand: GpsTrailPoint = {
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          accuracy_m: acc,
+          ts: pos.timestamp ? pos.timestamp : nowMs,
+        };
+        if (!isGpsPointAcceptableForTrail(cand, lastAcceptedRef.current, nowMs)) {
+          setStatusText("GPS fix not acceptable yet. Move to open sky and try again.");
+          setStatusTone("warning");
+          return;
+        }
+        rawLat = cand.lat;
+        rawLon = cand.lon;
       }
-      const stationFt = parseStationToFeet(entryStationText) ?? null;
+      const stationFt = parseStationToFeet(stationText) ?? null;
       let photoDataUrl: string | null = null;
-      if (entryPhotoFile) {
+      if (photoFile) {
         photoDataUrl = await new Promise<string>((resolve, reject) => {
           const r = new FileReader();
           r.onload = () => resolve(String(r.result || ""));
           r.onerror = () => reject(new Error("photo read failed"));
-          r.readAsDataURL(entryPhotoFile);
+          r.readAsDataURL(photoFile);
         });
       }
       const snapped = snapToRoute(rawLat, rawLon, routeCoords);
       const newEntry: WalkEntry = {
         id: `entry_${Date.now()}`,
-        station_text: entryStationText || "",
+        station_text: stationText || "",
         station_ft: stationFt,
-        note: entryNote || "",
+        note: noteText || "",
         photoDataUrl,
         raw_lat: rawLat,
         raw_lon: rawLon,
@@ -1975,6 +2105,10 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
   const hasDesign = (kmzLineFeatures.length || kmzPolygonFeatures.length) > 0;
   const hasBoreFiles = (state?.loaded_field_data_files || 0) > 0;
   const hasGeneratedOutput = redlineSegments.length > 0 || stationPoints.length > 0;
+
+  if (!hasHydrated) {
+    return null;
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(180deg, #eef3f8 0%, #f6f9fc 100%)", fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif", color: "#0f172a" }}>
@@ -2200,6 +2334,7 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                   if (!isPanning) setHoverStationIndex(null);
                 }}
               >
+                {isMobileWalk ? <MobileWalkNorthCompass /> : null}
                 {renderBounds && projectionMetrics && allCoords.length > 0 ? (
                   <svg
                     viewBox={viewBoxToString(projectionMetrics, viewport)}
@@ -2596,201 +2731,95 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                   </div>
                 ) : null}
 
-                { /* Walk controls overlay */ }
+                {/* Walk controls overlay */}
                 <div
-                  style={{ position: "absolute", right: 12, top: 12, zIndex: 1000, pointerEvents: "auto" }}
+                  style={{
+                    position: "absolute",
+                    ...(isMobileWalk ? { left: 12, top: 12 } : { right: 12, top: 12 }),
+                    zIndex: 1000,
+                    pointerEvents: "auto",
+                  }}
                   onPointerDown={(e) => { e.stopPropagation(); }}
                 >
-                  {/* Walk status — single displaySession source: active walk or latest saved ended session */}
-                  {displaySession && (activeSession?.status === "active" || displaySession.status === "ended") ? (
-                    <div style={{
-                      marginBottom: 6,
-                      background: activeSession ? "rgba(14,24,34,0.92)" : "rgba(30,41,59,0.88)",
-                      border: activeSession ? "1px solid #38bdf8" : "1px solid #10b981",
-                      borderRadius: 10,
-                      padding: "6px 10px",
-                      pointerEvents: "none",
-                    }}>
-                      {activeSession?.status === "active" ? (
-                        <>
-                          <div style={{ fontSize: 11, fontWeight: 800, color: "#38bdf8", letterSpacing: 0.3 }}>
-                            ● WALK ACTIVE
-                          </div>
-                          <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
-                            GPS: {gpsAccuracy === null ? "no signal" : gpsAccuracy > 20 ? `±${Math.round(gpsAccuracy)}m (weak)` : `±${Math.round(gpsAccuracy)}m`}
-                          </div>
-                          <div style={{ fontSize: 11, color: "#cbd5e1" }}>
-                            Trail pts: {gpsTrailState.length} · Entries: {displaySession.entry_count}
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <div style={{ fontSize: 11, fontWeight: 800, color: "#10b981", letterSpacing: 0.3 }}>
-                            ✓ WALK ENDED — tap green dots to review
-                          </div>
-                          <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
-                            Trail pts: {endedWalkGpsTrail.length} · Entries: {displaySession.entry_count}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  ) : null}
-
-                  {!isMobileWalk ? (
-                    <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
-                      {(() => {
-                        const isActive: boolean = !!(activeSession && activeSession.status === "active");
-                        return activeSession ? (
+                    {/* Walk status — single displaySession source: active walk or latest saved ended session */}
+                    {displaySession && (activeSession?.status === "active" || displaySession.status === "ended") ? (
+                      <div style={{
+                        marginBottom: 6,
+                        background: activeSession ? "rgba(14,24,34,0.92)" : "rgba(30,41,59,0.88)",
+                        border: activeSession ? "1px solid #38bdf8" : "1px solid #10b981",
+                        borderRadius: 10,
+                        padding: "6px 10px",
+                        pointerEvents: "none",
+                      }}>
+                        {activeSession?.status === "active" ? (
                           <>
-                            <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={openAddEntryModal} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ffffff", color: "#0f172a", pointerEvents: "auto" }}>Add Entry</button>
-                            <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={endWalk} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ef4444", color: "#fff", pointerEvents: "auto" }}>End Walk</button>
+                            <div style={{ fontSize: 11, fontWeight: 800, color: "#38bdf8", letterSpacing: 0.3 }}>
+                              ● WALK ACTIVE
+                            </div>
+                            {isMobileWalk && (gpsAccuracy === null || gpsAccuracy > 25) ? (
+                              <div style={{ fontSize: 11, color: "#fbbf24", marginTop: 4, fontWeight: 800, display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ width: 8, height: 8, borderRadius: 999, background: "#f59e0b", flexShrink: 0 }} />
+                                GPS weak — move to open sky.
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
+                                GPS: {gpsAccuracy === null ? "no signal" : gpsAccuracy > 20 ? `±${Math.round(gpsAccuracy)}m (weak)` : `±${Math.round(gpsAccuracy)}m`}
+                              </div>
+                            )}
+                            <div style={{ fontSize: 11, color: "#cbd5e1" }}>
+                              Trail pts: {gpsTrailState.length} · Entries: {displaySession.entry_count}
+                            </div>
                           </>
                         ) : (
-                          <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={startWalk} disabled={busy || isActive} style={{ ...miniMapButton, background: isActive ? "#0f172a" : "#ffffff", color: isActive ? "#fff" : "#0f172a", pointerEvents: "auto" }}>Start Walk</button>
-                        );
-                      })()}
-                    </div>
-                  ) : null}
+                          <>
+                            <div style={{ fontSize: 11, fontWeight: 800, color: "#10b981", letterSpacing: 0.3 }}>
+                              ✓ WALK ENDED — tap green dots to review
+                            </div>
+                            <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
+                              Trail pts: {endedWalkGpsTrail.length} · Entries: {displaySession.entry_count}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : null}
+
+                    {!isMobileWalk ? (
+                      <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
+                        {(() => {
+                          const isActive: boolean = !!(activeSession && activeSession.status === "active");
+                          return activeSession ? (
+                            <>
+                              <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={openAddEntryModal} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ffffff", color: "#0f172a", pointerEvents: "auto" }}>Add Entry</button>
+                              <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={endWalk} disabled={busy || !isActive} style={{ ...miniMapButton, background: "#ef4444", color: "#fff", pointerEvents: "auto" }}>End Walk</button>
+                            </>
+                          ) : (
+                            <button onPointerDown={(e) => { e.stopPropagation(); }} onClick={startWalk} disabled={busy || isActive} style={{ ...miniMapButton, background: isActive ? "#0f172a" : "#ffffff", color: isActive ? "#fff" : "#0f172a", pointerEvents: "auto" }}>Start Walk</button>
+                          );
+                        })()}
+                      </div>
+                    ) : null}
                 </div>
 
-                {/* Mobile field controls */}
                 {isMobileWalk ? (
-                  <>
-                    <input
-                      ref={mobilePhotoInputRef}
-                      type="file"
-                      accept="image/*"
-                      capture="environment"
-                      style={{ display: "none" }}
-                      onChange={(e) => {
-                        const f = e.target.files ? e.target.files[0] : null;
-                        setEntryPhotoFile(f);
-                        try {
-                          e.currentTarget.value = "";
-                        } catch (err) {
-                          // ignore
-                        }
-                        if (f) {
-                          setStatusText("Photo attached to current entry.");
-                          setStatusTone("success");
-                        }
-                      }}
-                    />
-                    <div
-                      style={{
-                        position: "absolute",
-                        left: 10,
-                        right: 10,
-                        bottom: 10,
-                        zIndex: 1001,
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: 10,
-                        maxWidth: 520,
-                        marginLeft: "auto",
-                        marginRight: "auto",
-                        pointerEvents: "auto",
-                      }}
-                      onPointerDown={(e) => e.stopPropagation()}
-                    >
-                      <button
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={startWalk}
-                        disabled={busy || (!!activeSession && activeSession.status === "active")}
-                        style={{
-                          width: "100%",
-                          ...buttonStyle("#0f172a", "#ffffff", "#0f172a", busy || (!!activeSession && activeSession.status === "active")),
-                          fontSize: 17,
-                          minHeight: 54,
-                          paddingTop: 12,
-                          paddingBottom: 12,
-                        }}
-                      >
-                        Start Walk
-                      </button>
-                      <button
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={openAddEntryModal}
-                        disabled={busy || !activeSession || activeSession.status !== "active"}
-                        style={{
-                          width: "100%",
-                          ...buttonStyle("#ffffff", "#0f172a", "#cfd8e3", busy || !activeSession || activeSession.status !== "active"),
-                          fontSize: 17,
-                          minHeight: 54,
-                          paddingTop: 12,
-                          paddingBottom: 12,
-                        }}
-                      >
-                        Add Station / Event
-                      </button>
-                      <button
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={() => {
-                          if (!activeSession || activeSession.status !== "active") {
-                            setStatusText("Start a walk first.");
-                            setStatusTone("warning");
-                            return;
-                          }
-                          if (!showAddEntryModal) {
-                            pendingMobileCameraAfterModalRef.current = true;
-                            openAddEntryModal();
-                            return;
-                          }
-                          mobilePhotoInputRef.current?.click();
-                        }}
-                        disabled={busy || !activeSession || activeSession.status !== "active"}
-                        style={{
-                          width: "100%",
-                          ...buttonStyle("#ffffff", "#0f172a", "#cfd8e3", busy || !activeSession || activeSession.status !== "active"),
-                          fontSize: 17,
-                          minHeight: 54,
-                          paddingTop: 12,
-                          paddingBottom: 12,
-                        }}
-                      >
-                        Photo
-                      </button>
-                      <div style={{ display: "flex", gap: 10, width: "100%" }}>
-                        <button
-                          onPointerDown={(e) => e.stopPropagation()}
-                          onClick={endWalk}
-                          disabled={busy || !activeSession || activeSession.status !== "active"}
-                          style={{
-                            flex: 1,
-                            ...buttonStyle("#ef4444", "#ffffff", "#ef4444", busy || !activeSession || activeSession.status !== "active"),
-                            fontSize: 17,
-                            minHeight: 54,
-                            paddingTop: 12,
-                            paddingBottom: 12,
-                          }}
-                        >
-                          End Walk
-                        </button>
-                        <button
-                          onPointerDown={(e) => e.stopPropagation()}
-                          onClick={() => {
-                            setStatusText("Send Home is not implemented yet in this sandbox build.");
-                            setStatusTone("warning");
-                          }}
-                          disabled={busy}
-                          style={{
-                            flex: 1,
-                            ...buttonStyle("#10b981", "#ffffff", "#10b981", busy),
-                            fontSize: 17,
-                            minHeight: 54,
-                            paddingTop: 12,
-                            paddingBottom: 12,
-                          }}
-                        >
-                          Send Home
-                        </button>
-                      </div>
-                    </div>
-                  </>
+                  <MobileWalkUI
+                    busy={busy}
+                    activeSession={activeSession}
+                    showAddEntryModal={showAddEntryModal}
+                    currentGps={currentGps}
+                    onStartWalk={startWalk}
+                    onEndWalk={endWalk}
+                    onOpenAddEntry={openAddEntryModal}
+                    onCloseAddEntryModal={() => setShowAddEntryModal(false)}
+                    onAddEntry={(p) => void submitAddEntry(p)}
+                    onSendHome={() => {
+                      setStatusText("Send Home is not implemented yet in this sandbox build.");
+                      setStatusTone("warning");
+                    }}
+                  />
                 ) : null}
 
                 { /* Add Entry Modal */ }
-                {showAddEntryModal ? (
+                {!isMobileWalk && showAddEntryModal ? (
                   <div
                     style={{ position: "absolute", left: 20, top: 20, zIndex: 1000, width: 420, borderRadius: 12, background: "#ffffff", border: "1px solid #dbe4ee", boxShadow: "0 18px 42px rgba(0,0,0,0.28)", padding: 12, pointerEvents: "auto" }}
                     onPointerDown={(e) => e.stopPropagation()}
@@ -2808,7 +2837,7 @@ export default function RedlineMap({ mode }: { mode?: "desktop" | "mobileWalk" }
                       </div>
                       <div style={{ display: "flex", gap: 8, marginTop: 6, pointerEvents: "auto" }}>
                         <button onClick={() => setShowAddEntryModal(false)} style={{ ...buttonStyle("#ffffff", "#0f172a", "#000000", false), pointerEvents: "auto" }} onPointerDown={(e) => e.stopPropagation()}>Cancel</button>
-                        <button onClick={submitAddEntry} style={{ ...buttonStyle("#0f172a", "#ffffff", "#000000", busy), pointerEvents: "auto" }} onPointerDown={(e) => e.stopPropagation()}>Save Entry</button>
+                        <button onClick={() => void submitAddEntry()} style={{ ...buttonStyle("#0f172a", "#ffffff", "#000000", busy), pointerEvents: "auto" }} onPointerDown={(e) => e.stopPropagation()}>Save Entry</button>
                       </div>
                     </div>
                   </div>
